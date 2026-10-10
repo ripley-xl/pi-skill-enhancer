@@ -14,7 +14,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { formatSkillsForPrompt } from "@earendil-works/pi-coding-agent";
 
-// P0：codex 式触发措辞。强度来源是"必须用 + 跳过要解释"，模型默认动作从跳过翻转为使用。
+// P0: codex-style trigger wording.
+// The strength comes from "must use + explain when skipping"; the model's default action flips from skipping to using.
 const TRIGGER_GUIDELINES = [
   "skill 触发规则：用户提及了某个 skill，或当前任务明显匹配 available_skills 目录中某个 skill 的 description 时，这一轮必须使用该 skill；提及多个就全部使用。除非再次被提及，不要把 skill 延续到后面的轮次。",
   "skill 使用方式：决定使用某个 skill 后，先用 read 工具完整读完它的 SKILL.md，再开始任何任务动作。",
@@ -24,8 +25,8 @@ const TRIGGER_GUIDELINES = [
 const BUDGET_RATIO = 0.02;
 const USAGE_ENTRY_TYPE = "skill-usage";
 
-// /skill:名称 展开后的消息头（agent-session 的 _expandSkillCommand 产物），
-// 展开只在整条消息以 /skill: 开头时发生，所以只匹配文本开头。
+// Message header of an expanded /skill:name command (produced by agent-session's _expandSkillCommand).
+// Expansion only happens when the whole message starts with /skill:, so only match at the start of the text.
 const MANUAL_SKILL_BLOCK = /^<skill name="([^"]+)" location="([^"]+)">/;
 
 interface SkillUsageData {
@@ -36,8 +37,8 @@ interface SkillUsageData {
   model?: string;
 }
 
-// read 工具允许 ~、@ 前缀、file:// 等形式，这里对齐到绝对路径；
-// resolvePath 未从包里导出，只补最常见的三种形式。
+// The read tool accepts ~, @ prefix, file://, etc.; normalize to an absolute path here.
+// pi's own resolvePath is not exported from the package, so only the most common forms are covered.
 const normalizeReadPath = (raw: string, cwd: string): string => {
   let path = raw.trim();
   if (path.startsWith("@")) path = path.slice(1);
@@ -46,7 +47,7 @@ const normalizeReadPath = (raw: string, cwd: string): string => {
   return isAbsolute(path) ? path : resolve(cwd, path);
 };
 
-// 模型可能经符号链接路径 read，与目录里的 filePath 对齐需要追一次 realpath。
+// The model may read through a symlinked path; aligning it with the catalog's filePath requires one realpath pass.
 const canonicalOf = (path: string): string => {
   try {
     return realpathSync.native(path);
@@ -55,8 +56,8 @@ const canonicalOf = (path: string): string => {
   }
 };
 
-// 目录 token 估算：CJK（汉字、假名、Hangul、CJK 标点、全角符号）接近 1.5 字符一个 token，
-// chars/4 只对英文成立；emoji 代理对仍按非 CJK 估，低估方向可接受。
+// Catalog token estimate: CJK (hanzi, kana, hangul, CJK punctuation, fullwidth forms) is close to 1.5 chars per token;
+// chars/4 only holds for English. Emoji surrogate pairs still count as non-CJK; underestimating is the acceptable direction.
 const estimateTokens = (text: string): number => {
   const cjk = (text.match(/[\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7a3\uf900-\ufaff\uff00-\uffef]/gu) ?? []).length;
   return Math.ceil(cjk / 1.5) + Math.ceil((text.length - cjk) / 4);
@@ -74,21 +75,21 @@ const userMessageText = (message: MessageStartEvent["message"]): string => {
 };
 
 export default function (pi: ExtensionAPI) {
-  // 本会话调用过的 skill：filePath -> name
+  // Skills invoked this session: filePath -> name
   const invoked = new Map<string, string>();
-  // 正文已在压缩中丢失、之后尚未重新加载的 skill filePath
+  // filePaths whose bodies were lost to compaction and have not been reloaded since
   const lost = new Set<string>();
-  // 进行中的 skill 文件 read：toolCallId -> filePath
+  // In-flight skill file reads: toolCallId -> filePath
   const pendingReads = new Map<string, string>();
-  // 最近一次 before_agent_start 目录里的 filePath -> name
+  // filePath -> name from the most recent before_agent_start catalog
   const skillNameByPath = new Map<string, string>();
-  // realpath 后的 filePath -> 目录里的 filePath，对齐符号链接路径的 read
+  // realpath-resolved filePath -> catalog filePath, aligning reads that go through symlinks
   const rawPathByCanonical = new Map<string, string>();
   let budgetWarned = false;
   let stateRebuilt = false;
   let boundSessionManager: ExtensionContext["sessionManager"] | undefined;
 
-  // 调用记录写成 transcript 里的 custom entry：结构化、不进 LLM 上下文、随会话持久化。
+  // Usage records are written as transcript custom entries: structured, never enter the LLM context, persist with the session.
   const recordUsage = (name: string, path: string, via: "read" | "command", ctx: ExtensionContext) => {
     const data: SkillUsageData = {
       ts: new Date().toISOString(),
@@ -100,8 +101,9 @@ export default function (pi: ExtensionAPI) {
     pi.appendEntry<SkillUsageData>(USAGE_ENTRY_TYPE, data);
   };
 
-  // pi 压缩会原文保留 firstKeptEntryId 之后的尾部，落在保留区内的调用正文并未丢失，
-  // 只标保留区之外的；找不到边界时 stillPresent 为空，退化为全标（保守方向）。
+  // pi compaction keeps the tail after firstKeptEntryId verbatim, so invocations inside the retained region
+  // have not lost their bodies; only mark those outside it.
+  // If the boundary cannot be found, stillPresent stays empty and everything is marked (conservative direction).
   const markLostForCompaction = (entries: SessionEntry[], firstKeptEntryId: string) => {
     const keptIndex = entries.findIndex((entry) => entry.id === firstKeptEntryId);
     const stillPresent = new Set<string>();
@@ -119,8 +121,9 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  // 首次 before_agent_start 时按当前分支重放状态机：usage 条目记调用，compaction 条目记丢失。
-  // 会话 resume 和 /reload 重载扩展后都能恢复。
+  // Replay the state machine over the current branch on the first before_agent_start:
+  // usage entries record invocations, compaction entries record losses.
+  // Survives session resume and extension reload via /reload.
   const rebuildState = (ctx: ExtensionContext) => {
     invoked.clear();
     lost.clear();
@@ -141,9 +144,9 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  // before_agent_start 每轮触发；systemPromptOptions 是当轮的深拷贝，改动不跨轮累积。
+  // before_agent_start fires every turn; systemPromptOptions is a per-turn deep copy, so edits do not accumulate across turns.
   pi.on("before_agent_start", (event: BeforeAgentStartEvent, ctx) => {
-    // SDK 嵌入方可能让多个会话共用同一扩展实例，会话变了必须重放状态。
+    // SDK embedders may share one extension instance across sessions; replay state whenever the session changes.
     if (boundSessionManager !== ctx.sessionManager) {
       boundSessionManager = ctx.sessionManager;
       stateRebuilt = false;
@@ -155,7 +158,7 @@ export default function (pi: ExtensionAPI) {
 
     const options = event.systemPromptOptions;
 
-    // P0：目录为空时不推触发规则，避免模型去找不存在的 skill。
+    // P0: do not push trigger rules when the catalog is empty, so the model does not go looking for skills that do not exist.
     if (options.skills.length > 0) {
       options.promptGuidelines.push(...TRIGGER_GUIDELINES);
     }
@@ -167,8 +170,9 @@ export default function (pi: ExtensionAPI) {
       rawPathByCanonical.set(canonicalOf(skill.filePath), skill.filePath);
     }
 
-    // P2：压缩后正文丢失的 skill 排到目录最前并标注，提醒模型需要时重新 read。
-    // 未压缩或没有丢失时不动数组，避免触发 system prompt 分节 diff。
+    // P2: skills whose bodies were lost to compaction move to the front of the catalog with a marker,
+    // reminding the model to re-read them when needed.
+    // When nothing was compacted or lost, do not touch the array, to avoid churning system prompt section diffs.
     if (lost.size > 0) {
       const lostSkills = options.skills.filter((skill) => lost.has(skill.filePath));
       const rest = options.skills.filter((skill) => !lost.has(skill.filePath));
@@ -181,7 +185,7 @@ export default function (pi: ExtensionAPI) {
       ];
     }
 
-    // P1：目录估算超 2% 窗口时提示一次，回落后重新越过再报。
+    // P1: warn once when the catalog estimate exceeds 2% of the window; re-arms after dropping back below and crossing again.
     const contextWindow = ctx.model?.contextWindow;
     if (contextWindow && contextWindow > 0) {
       const tokens = estimateTokens(formatSkillsForPrompt(options.skills, "read"));
@@ -199,16 +203,16 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // 手动 /skill: 调用：展开块随用户消息内联进历史，登记调用但不标 lost。
-  // 用 message_start 而不是 before_agent_start：流式期间排队的 /skill: 不触发 before_agent_start，
-  // 而 message_start 对初始消息和排队消息都各触发一次（agent-loop 对每条 initial/queued 消息 emit）。
+  // Manual /skill: invocation: the expanded block is inlined into history with the user message; register the invocation but do not mark lost.
+  // Use message_start rather than before_agent_start: /skill: queued during streaming does not fire before_agent_start,
+  // while message_start fires once for each initial and queued message (agent-loop emits per initial/queued message).
   pi.on("message_start", (event: MessageStartEvent, ctx) => {
     const text = userMessageText(event.message);
     if (!text) return;
     const manual = MANUAL_SKILL_BLOCK.exec(text);
     if (!manual) return;
     const [, name, location] = manual;
-    // 只认目录里的已知 skill：用户粘贴以该格式开头的文本不会被记成调用。
+    // Only accept skills known to the catalog: text pasted in the same format is not recorded as an invocation.
     if (!skillNameByPath.has(location)) return;
     invoked.set(location, name);
     lost.delete(location);
@@ -236,19 +240,20 @@ export default function (pi: ExtensionAPI) {
 
     const name = skillNameByPath.get(path) ?? basename(dirname(path));
     invoked.set(path, name);
-    // 重新 read 后正文已回到历史，不再需要标注。
+    // After re-reading, the body is back in history; the marker is no longer needed.
     lost.delete(path);
 
     recordUsage(name, path, "read", ctx);
   });
 
-  // run 中途的 overflow 压缩要等下一次 before_agent_start（下一个用户提交）才把标注带进
-  // system prompt；prompt 前的阈值压缩当轮即可标注。
+  // An overflow compaction mid-run only carries the marker into the system prompt at the next
+  // before_agent_start (the next user submission); a threshold compaction before the prompt is marked in the same turn.
   pi.on("session_compact", (event: SessionCompactEvent, ctx) => {
     markLostForCompaction(ctx.sessionManager.getBranch(), event.compactionEntry.firstKeptEntryId);
   });
 
-  // /tree 导航停留在同一会话与扩展实例，分支变了必须重放，否则 invoked/lost 与当前分支脱节。
+  // /tree navigation stays in the same session and extension instance; a branch change must replay,
+  // otherwise invoked/lost drift out of sync with the current branch.
   pi.on("session_tree", (_event: SessionTreeEvent, ctx) => {
     rebuildState(ctx);
   });
