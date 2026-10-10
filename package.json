@@ -1,0 +1,21 @@
+{
+  "name": "pi-skill-enhancer",
+  "version": "0.1.0",
+  "description": "Strengthens pi's skill system: mandatory skill trigger rules, a token-budget warning for the skill catalog, and reload markers for skills lost to compaction.",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ripley-xl/pi-skill-enhancer.git"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/skill-enhancer.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
