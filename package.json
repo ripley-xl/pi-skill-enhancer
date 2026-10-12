@@ -6,6 +6,9 @@
     "pi-package"
   ],
   "license": "MIT",
+  "files": [
+    "extensions"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ripley-xl/pi-skill-enhancer.git"
