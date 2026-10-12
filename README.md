@@ -7,13 +7,13 @@ Pi extension that strengthens the skill system: stricter trigger rules, a token-
 ## Install
 
 ```bash
-pi install git:github.com/ripley-xl/pi-skill-enhancer
+pi install npm:pi-skill-enhancer
 ```
 
-Once published to npm, equivalently:
+Or from git:
 
 ```bash
-pi install npm:pi-skill-enhancer
+pi install git:github.com/ripley-xl/pi-skill-enhancer
 ```
 
 ## Features
